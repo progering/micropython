@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 import json
 import tempfile
-import os
+import hashlib
 import os.path
 
 from .commands import CommandError, show_progress_bar
@@ -102,7 +102,9 @@ def _download_file(transport, url, dest, package_info, target):
     if "files" not in package_info:
         # this step is postponed in order to get "files" as last entry of the package info
         package_info["files"] = []
-    package_info["files"].append({"path": relative_dest})
+    package_info["files"].append(
+        {"path": relative_dest, "sha256": hashlib.sha256(data).hexdigest()}
+    )
 
 
 def _install_json(

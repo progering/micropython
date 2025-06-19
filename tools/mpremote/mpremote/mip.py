@@ -73,7 +73,7 @@ def _rewrite_url(url, branch=None):
     return url
 
 
-def _download_file(transport, url, dest):
+def _download_file(transport, url, dest, package_info, target):
     if url.startswith(allowed_mip_url_prefixes):
         try:
             with urllib.request.urlopen(url) as src:
@@ -97,9 +97,14 @@ def _download_file(transport, url, dest):
     print("Installing:", dest)
     _ensure_path_exists(transport, dest)
     transport.fs_writefile(dest, data, progress_callback=show_progress_bar)
+    assert dest.startswith(target)
+    relative_dest = dest[len(target) :].lstrip("/")
+    package_info["files"].append({"path": relative_dest})
 
 
-def _install_json(transport, package_json_url, index, target, version, mpy):
+def _install_json(
+    transport, package_json_url, index, target, version, mpy, package_info, target_info
+):
     base_url = ""
     if package_json_url.startswith(allowed_mip_url_prefixes):
         try:
@@ -128,22 +133,45 @@ def _install_json(transport, package_json_url, index, target, version, mpy):
             print("Exists:", fs_target_path)
         else:
             file_url = f"{index}/file/{short_hash[:2]}/{short_hash}"
-            _download_file(transport, file_url, fs_target_path)
+            _download_file(transport, file_url, fs_target_path, package_info, target)
     for target_path, url in package_json.get("urls", ()):
         fs_target_path = target + "/" + target_path
         if base_url and not url.startswith(allowed_mip_url_prefixes):
             url = f"{base_url}/{url}"  # Relative URLs
-        _download_file(transport, _rewrite_url(url, version), fs_target_path)
+        _download_file(transport, _rewrite_url(url, version), fs_target_path, package_info, target)
     for dep, dep_version in package_json.get("deps", ()):
-        _install_package(transport, dep, index, target, dep_version, mpy)
+        _install_package(transport, dep, index, target, dep_version, mpy, target_info)
+
+    package_info["metadata"] = package_json
+    if package_json_url.startswith(index):
+        package_info["index"] = index
+        reported_version = package_json.get("version")
+        # Note that the reliability of the reported version is guaranteed only in case of index packages.
+        # Even if a GitHub repo has corresponding tag, its other commits (between releases)
+        # may also contain the same reported version.
+        if reported_version is not None:
+            package_info["resolved_version"] = reported_version
 
 
-def _install_package(transport, package, index, target, version, mpy):
+def _install_package(transport, package, index, target, version, mpy, target_info):
+    _uninstall_package(transport, package, target, target_info, is_expected_to_exist=False)
+
+    package_info = {"package": _normalize_package_specifier(package), "files": []}
+    if version is not None:
+        package_info["requested_version"] = version
+    target_info.append(package_info)
+
     if package.startswith(allowed_mip_url_prefixes):
+        if package.startswith(":github") or package.startswith(":gitlab"):
+            resolved_version = _try_resolve_version_as_git_reference(package, version)
+            if resolved_version is not None:
+                package_info["resolved_version"] = resolved_version
+                version = resolved_version
         if package.endswith(".py") or package.endswith(".mpy"):
             print(f"Downloading {package} to {target}")
+            fs_target_path = target + "/" + package.rsplit("/")[-1]
             _download_file(
-                transport, _rewrite_url(package, version), target + "/" + package.rsplit("/")[-1]
+                transport, _rewrite_url(package, version), fs_target_path, package_info, target
             )
             return
         else:
@@ -166,14 +194,194 @@ def _install_package(transport, package, index, target, version, mpy):
 
         package = f"{index}/package/{mpy_version}/{package}/{version}.json"
 
-    _install_json(transport, package, index, target, version, mpy)
+    _install_json(transport, package, index, target, version, mpy, package_info, target_info)
+
+
+def _list_packages(args, target_info):
+    for entry in target_info:
+        print(entry["package"], end="")
+
+        version = entry.get("resolved_version", entry.get("requested_version")) or "latest"
+        if version != "latest":
+            print(f"@{version}", end="")
+
+        index = entry.get("index")
+        if index is not None and index != _PACKAGE_INDEX:
+            print(f" from {index}")
+
+        print()
+
+
+def _uninstall_package(transport, package, target, target_info, is_expected_to_exist):
+    target = target.rstrip("/")
+    dirs_to_check = []
+    did_uninstall = False
+    for i in reversed(range(len(target_info))):
+        package_info = target_info[i]
+        if package_info["package"] == package:
+            print(f"Uninstalling {package} from {target}")
+            for file in package_info["files"]:
+                full_path = target + "/" + file["path"]
+                print("Uninstalling:", full_path)
+                if transport.fs_exists(full_path):
+                    transport.fs_rmfile(full_path)
+                    parent_dir = full_path.rsplit("/", maxsplit=1)[0]
+                    if parent_dir not in dirs_to_check:
+                        dirs_to_check.append(parent_dir)
+
+            # remove directories, which became empty because of this uninstall (except target)
+            while dirs_to_check:
+                dir_to_check = dirs_to_check.pop(0)
+                if dir_to_check != target and not transport.fs_listdir(dir_to_check):
+                    print("Removing empty directory:", dir_to_check)
+                    transport.fs_rmdir(dir_to_check)
+                    parent_dir = dir_to_check.rsplit("/", maxsplit=1)[0]
+                    if parent_dir not in dirs_to_check and parent_dir != target:
+                        dirs_to_check.append(parent_dir)
+
+            del target_info[i]
+            did_uninstall = True
+
+    if not did_uninstall and is_expected_to_exist:
+        raise CommandError(f"mip: package '{package}' not found")
+
+
+def _get_target_info_path(args):
+    return args.target.rstrip("/") + "/packages-info.json"
+
+
+def _normalize_package_specifier(package):
+    """
+    The same local package.json can be installed from different relative (or even absolute) directories.
+    A package from a git repo can be installed with or without explicit "/package.json" suffix.
+    In order to support automatic uninstall before install, the package specifier may need to be rewritten
+    for the target info file.
+    Need to record the package specifier so that it
+        # 1) reveals the type of the source
+        # 2) is distinguishable from other similar sources
+        # 3) doesn't reveal irrelevant details about the development machine (like project's path or OS)
+    """
+    if package.endswith(".json") and os.path.isfile(package):
+        project_name = os.path.basename(os.path.dirname(os.path.abspath(package)))
+        return project_name + "/" + os.path.basename(package)
+
+    package_json_url_suffix = "/package.json"
+    if package.startswith(allowed_mip_url_prefixes) and package.endswith(package_json_url_suffix):
+        return package[: -len(package_json_url_suffix)]
+
+    return package
+
+
+def _load_target_info(state, args):
+    path = _get_target_info_path(args)
+    if state.transport.fs_exists(path):
+        return json.loads(state.transport.fs_readfile(path).decode("utf-8"))
+    else:
+        return []
+
+
+def _save_target_info(state, args, target_info):
+    state.transport.fs_writefile(
+        _get_target_info_path(args),
+        json.dumps(target_info, indent=4, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _try_resolve_version_as_git_reference(package, version):
+    if version == "latest":
+        git_ref = "HEAD"
+    else:
+        git_ref = version
+
+    if package.startswith("github:"):
+        host = "https://github.com"
+        org, project = package[7:].split("/")[:2]
+    elif package.startswith("gitlab:"):
+        host = "https://gitlab.com"
+        org, project = package[7:].split("/")[:2]
+    else:
+        raise ValueError("Unexpected package reference: " + package)
+
+    repo_url = f"{host}/{org}/{project}.git"
+
+    tags, heads = _fetch_git_refs(repo_url)
+    if git_ref in tags:
+        return git_ref
+
+    return heads.get(git_ref, None)
+
+
+def _fetch_git_refs(repo_url):
+    """
+    Returns two dictionaries mapping tags to commit hashes and branches (including pseudo-branch HEAD) to commit hashes
+    """
+    assert repo_url.endswith(".git")
+
+    req = urllib.request.Request(
+        "/info/refs?service=git-upload-pack",
+        headers={"User-Agent": "python-ref-resolver/0.2"},
+    )
+    data = urllib.request.urlopen(req, timeout=15).read()
+
+    def pkt_lines(raw: bytes):
+        i = 0
+        while i < len(raw):
+            n = int(raw[i : i + 4], 16)
+            i += 4
+            if n == 0:  # flush
+                continue
+            yield raw[i : i + n - 4].rstrip(b"\r\n")
+            i += n - 4
+
+    tags = {}
+    heads = {}
+
+    for pl in pkt_lines(data):
+        if pl.startswith(b"#"):  # “# service=…”
+            continue
+
+        sha, rest = pl.split(b" ", 1)
+        name, *cap = rest.split(b"\0", 1)
+        name = name.decode()
+        sha = sha.decode()
+
+        if name.endswith("^{}"):  # peeled helper line
+            continue
+        elif name == "HEAD":
+            heads[name] = sha
+        elif name.startswith("refs/tags/"):
+            tags[name[10:]] = sha
+        elif name.startswith("refs/heads/"):
+            heads[name[11:]] = sha
+
+    return tags, heads
 
 
 def do_mip(state, args):
     state.did_action()
 
-    if args.command[0] == "install":
+    if args.command[0] in ["install", "list", "uninstall"]:
         state.ensure_raw_repl()
+
+        if args.target is None:
+            state.transport.exec("import sys")
+            lib_paths = [
+                p
+                for p in state.transport.eval("sys.path")
+                if not p.startswith("/rom") and p.endswith("/lib")
+            ]
+            if lib_paths and lib_paths[0]:
+                args.target = lib_paths[0]
+            else:
+                raise CommandError("Unable to find lib dir in sys.path, use --target to override")
+
+        target_info = _load_target_info(state, args)
+    else:
+        raise CommandError(f"mip: '{args.command[0]}' is not a command")
+
+    if args.command[0] == "install":
+        if not args.packages:
+            raise CommandError("mip: install requires one or more package arguments")
 
         for package in args.packages:
             version = None
@@ -184,20 +392,6 @@ def do_mip(state, args):
 
             if args.index is None:
                 args.index = _PACKAGE_INDEX
-
-            if args.target is None:
-                state.transport.exec("import sys")
-                lib_paths = [
-                    p
-                    for p in state.transport.eval("sys.path")
-                    if not p.startswith("/rom") and p.endswith("/lib")
-                ]
-                if lib_paths and lib_paths[0]:
-                    args.target = lib_paths[0]
-                else:
-                    raise CommandError(
-                        "Unable to find lib dir in sys.path, use --target to override"
-                    )
 
             if args.mpy is None:
                 args.mpy = True
@@ -210,10 +404,39 @@ def do_mip(state, args):
                     args.target,
                     version,
                     args.mpy,
+                    target_info,
                 )
             except CommandError:
                 print("Package may be partially installed")
                 raise
             print("Done")
-    else:
-        raise CommandError(f"mip: '{args.command[0]}' is not a command")
+
+        _save_target_info(state, args, target_info)
+
+    elif args.command[0] == "list":
+        if args.packages:
+            raise CommandError("mip: list does not take package arguments")
+        _list_packages(args, target_info)
+
+    elif args.command[0] == "uninstall":
+        if not args.packages:
+            raise CommandError("mip: uninstall requires one or more package arguments")
+
+        for package in args.packages:
+            print("Uninstall", package)
+            _uninstall_package(
+                state.transport, package, args.target, target_info, is_expected_to_exist=True
+            )
+        if target_info == []:
+            target_info_path = _get_target_info_path(args)
+            if state.transport.fs_exists(target_info_path):
+                print("Removing empty", target_info_path)
+                state.transport.fs_rmfile(target_info_path)
+        else:
+            _save_target_info(state, args, target_info)
+
+
+if __name__ == "__main__":
+    tags, heads = _fetch_git_refs("https://github.com/thonny/thonny.git")
+    print(tags)
+    print(heads)

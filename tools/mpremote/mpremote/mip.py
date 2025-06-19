@@ -44,7 +44,7 @@ def _check_exists(transport, path, short_hash):
 
 
 def _rewrite_url(url, branch=None):
-    if not branch:
+    if not branch or branch == "latest":
         branch = "HEAD"
     if url.startswith("github:"):
         url = url[7:].split("/")
@@ -99,6 +99,9 @@ def _download_file(transport, url, dest, package_info, target):
     transport.fs_writefile(dest, data, progress_callback=show_progress_bar)
     assert dest.startswith(target)
     relative_dest = dest[len(target) :].lstrip("/")
+    if "files" not in package_info:
+        # this step is postponed in order to get "files" as last entry of the package info
+        package_info["files"] = []
     package_info["files"].append({"path": relative_dest})
 
 
@@ -127,6 +130,17 @@ def _install_json(
         base_url = os.path.dirname(package_json_url)
     else:
         raise CommandError(f"Invalid url for package: {package_json_url}")
+
+    if package_json_url.startswith(index):
+        package_info["index"] = index
+        reported_version = package_json.get("version")
+        # Note that the reliability of the reported version is guaranteed only in case of index packages.
+        # Even if a GitHub repo has corresponding tag, its other commits (between releases)
+        # may also contain the same reported version.
+        if reported_version is not None:
+            package_info["resolved_version"] = reported_version
+    package_info["metadata"] = package_json
+
     for target_path, short_hash in package_json.get("hashes", ()):
         fs_target_path = target + "/" + target_path
         if _check_exists(transport, fs_target_path, short_hash):
@@ -142,27 +156,22 @@ def _install_json(
     for dep, dep_version in package_json.get("deps", ()):
         _install_package(transport, dep, index, target, dep_version, mpy, target_info)
 
-    package_info["metadata"] = package_json
-    if package_json_url.startswith(index):
-        package_info["index"] = index
-        reported_version = package_json.get("version")
-        # Note that the reliability of the reported version is guaranteed only in case of index packages.
-        # Even if a GitHub repo has corresponding tag, its other commits (between releases)
-        # may also contain the same reported version.
-        if reported_version is not None:
-            package_info["resolved_version"] = reported_version
+    if "files" not in package_info:
+        # make sure "files" is always present
+        package_info["files"] = []
 
 
 def _install_package(transport, package, index, target, version, mpy, target_info):
     _uninstall_package(transport, package, target, target_info, is_expected_to_exist=False)
 
-    package_info = {"package": _normalize_package_specifier(package), "files": []}
-    if version is not None:
-        package_info["requested_version"] = version
+    if version is None:
+        version = "latest"
+
+    package_info = {"package": _normalize_package_specifier(package), "requested_version": version}
     target_info.append(package_info)
 
     if package.startswith(allowed_mip_url_prefixes):
-        if package.startswith(":github") or package.startswith(":gitlab"):
+        if package.startswith("github:") or package.startswith("gitlab:"):
             resolved_version = _try_resolve_version_as_git_reference(package, version)
             if resolved_version is not None:
                 package_info["resolved_version"] = resolved_version
@@ -183,8 +192,6 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
     elif package.endswith(".json"):
         pass
     else:
-        if not version:
-            version = "latest"
         print(f"Installing {package} ({version}) from {index} to {target}")
 
         mpy_version = "py"
@@ -216,6 +223,7 @@ def _uninstall_package(transport, package, target, target_info, is_expected_to_e
     target = target.rstrip("/")
     dirs_to_check = []
     did_uninstall = False
+    package = _normalize_package_specifier(package)
     for i in reversed(range(len(target_info))):
         package_info = target_info[i]
         if package_info["package"] == package:
@@ -251,19 +259,8 @@ def _get_target_info_path(args):
 
 
 def _normalize_package_specifier(package):
-    """
-    The same local package.json can be installed from different relative (or even absolute) directories.
-    A package from a git repo can be installed with or without explicit "/package.json" suffix.
-    In order to support automatic uninstall before install, the package specifier may need to be rewritten
-    for the target info file.
-    Need to record the package specifier so that it
-        # 1) reveals the type of the source
-        # 2) is distinguishable from other similar sources
-        # 3) doesn't reveal irrelevant details about the development machine (like project's path or OS)
-    """
     if package.endswith(".json") and os.path.isfile(package):
-        project_name = os.path.basename(os.path.dirname(os.path.abspath(package)))
-        return project_name + "/" + os.path.basename(package)
+        return os.path.normpath(os.path.abspath(package))
 
     package_json_url_suffix = "/package.json"
     if package.startswith(allowed_mip_url_prefixes) and package.endswith(package_json_url_suffix):
@@ -283,12 +280,12 @@ def _load_target_info(state, args):
 def _save_target_info(state, args, target_info):
     state.transport.fs_writefile(
         _get_target_info_path(args),
-        json.dumps(target_info, indent=4, sort_keys=True).encode("utf-8"),
+        json.dumps(target_info, indent=2).encode("utf-8"),
     )
 
 
 def _try_resolve_version_as_git_reference(package, version):
-    if version == "latest":
+    if version in ["latest", None]:
         git_ref = "HEAD"
     else:
         git_ref = version
@@ -318,7 +315,7 @@ def _fetch_git_refs(repo_url):
     assert repo_url.endswith(".git")
 
     req = urllib.request.Request(
-        "/info/refs?service=git-upload-pack",
+        repo_url + "/info/refs?service=git-upload-pack",
         headers={"User-Agent": "python-ref-resolver/0.2"},
     )
     data = urllib.request.urlopen(req, timeout=15).read()
@@ -434,9 +431,3 @@ def do_mip(state, args):
                 state.transport.fs_rmfile(target_info_path)
         else:
             _save_target_info(state, args, target_info)
-
-
-if __name__ == "__main__":
-    tags, heads = _fetch_git_refs("https://github.com/thonny/thonny.git")
-    print(tags)
-    print(heads)

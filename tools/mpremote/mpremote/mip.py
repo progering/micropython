@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 import json
 import tempfile
+import re
 import hashlib
 import os.path
 
@@ -305,6 +306,13 @@ def _try_resolve_version_as_git_reference(package, version):
 
     tags, heads = _fetch_git_refs(repo_url)
     if git_ref in tags:
+        return git_ref
+
+    if git_ref in heads:
+        return heads[git_ref]
+
+    if re.fullmatch("[0-9a-fA-F]{7,40}", git_ref):
+        # looks like commit hash
         return git_ref
 
     return heads.get(git_ref, None)

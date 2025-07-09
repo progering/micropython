@@ -154,7 +154,9 @@ def _install_json(
         fs_target_path = target + "/" + target_path
         if base_url and not url.startswith(allowed_mip_url_prefixes):
             url = f"{base_url}/{url}"  # Relative URLs
-        _download_file(transport, _rewrite_url(url, version), fs_target_path, package_info, target)
+        _download_file(
+            transport, _rewrite_url(url, version), fs_target_path, package_info, target
+        )
     for dep, dep_version in package_json.get("deps", ()):
         _install_package(transport, dep, index, target, dep_version, mpy, target_info)
 
@@ -175,7 +177,10 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
     if version is None:
         version = "latest"
 
-    package_info = {"package": _normalize_package_specifier(package), "requested_version": version}
+    package_info = {
+        "package": _normalize_package_specifier(package),
+        "requested_version": version,
+    }
     target_info.append(package_info)
 
     if package.startswith(allowed_mip_url_prefixes):
@@ -188,7 +193,11 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
             print(f"Downloading {package} to {target}")
             fs_target_path = target + "/" + package.rsplit("/")[-1]
             _download_file(
-                transport, _rewrite_url(package, version), fs_target_path, package_info, target
+                transport,
+                _rewrite_url(package, version),
+                fs_target_path,
+                package_info,
+                target,
             )
             return
         else:
@@ -209,14 +218,18 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
 
         package = f"{index}/package/{mpy_version}/{package}/{version}.json"
 
-    _install_json(transport, package, index, target, version, mpy, package_info, target_info)
+    _install_json(
+        transport, package, index, target, version, mpy, package_info, target_info
+    )
 
 
 def _list_packages(args, target_info):
     for entry in target_info:
         print(entry["package"], end="")
 
-        version = entry.get("resolved_version", entry.get("requested_version")) or "latest"
+        version = (
+            entry.get("resolved_version", entry.get("requested_version")) or "latest"
+        )
         if version != "latest":
             print(f"@{version}", end="")
 
@@ -261,6 +274,7 @@ def _uninstall_package(transport, package, target, target_info):
     if not did_uninstall:
         raise CommandError(f"mip: package '{package}' not found")
 
+
 def _get_installed_version(package, target_info):
     # TODO
     for spec in target_info:
@@ -269,12 +283,14 @@ def _get_installed_version(package, target_info):
 
     return None
 
+
 def _installed_version_matches_requirement(installed_version, requirement):
     if requirement == "latest":
         # explicit "latest" always requires re-install
         return False
 
     return requirement is None or installed_version == requirement
+
 
 def _get_target_info_path(args):
     return args.target.rstrip("/") + "/mip-packages.json"
@@ -285,9 +301,10 @@ def _normalize_package_specifier(package):
         return os.path.normpath(os.path.abspath(package))
 
     package_json_url_suffix = "/package.json"
-    if package.startswith(allowed_mip_url_prefixes) and package.endswith(package_json_url_suffix):
+    if package.startswith(allowed_mip_url_prefixes) and package.endswith(
+        package_json_url_suffix
+    ):
         return package[: -len(package_json_url_suffix)]
-
 
     # TODO: What to do with trailing slashes?
 

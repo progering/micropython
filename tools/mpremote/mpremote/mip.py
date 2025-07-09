@@ -178,10 +178,10 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
         version = "latest"
 
     package_info = {
-        "package": _normalize_package_specifier(package),
         "requested_version": version,
     }
-    target_info.append(package_info)
+    package = _normalize_package_specifier(package)
+    target_info["packages"][package] = package_info
 
     if package.startswith(allowed_mip_url_prefixes):
         if package.startswith("github:") or package.startswith("gitlab:"):
@@ -224,8 +224,8 @@ def _install_package(transport, package, index, target, version, mpy, target_inf
 
 
 def _list_packages(args, target_info):
-    for entry in target_info:
-        print(entry["package"], end="")
+    for key, entry in target_info["packages"].items():
+        print(key, end="")
 
         version = (
             entry.get("resolved_version", entry.get("requested_version")) or "latest"
@@ -245,41 +245,38 @@ def _uninstall_package(transport, package, target, target_info):
     dirs_to_check = []
     did_uninstall = False
     package = _normalize_package_specifier(package)
-    for i in reversed(range(len(target_info))):
-        package_info = target_info[i]
-        if package_info["package"] == package:
-            print(f"Uninstalling {package} from {target}")
-            for file in package_info["files"]:
-                full_path = target + "/" + file["path"]
-                print("Uninstalling:", full_path)
-                if transport.fs_exists(full_path):
-                    transport.fs_rmfile(full_path)
-                    parent_dir = full_path.rsplit("/", maxsplit=1)[0]
-                    if parent_dir not in dirs_to_check:
-                        dirs_to_check.append(parent_dir)
-
-            # remove directories, which became empty because of this uninstall (except target)
-            while dirs_to_check:
-                dir_to_check = dirs_to_check.pop(0)
-                if dir_to_check != target and not transport.fs_listdir(dir_to_check):
-                    print("Removing empty directory:", dir_to_check)
-                    transport.fs_rmdir(dir_to_check)
-                    parent_dir = dir_to_check.rsplit("/", maxsplit=1)[0]
-                    if parent_dir not in dirs_to_check and parent_dir != target:
-                        dirs_to_check.append(parent_dir)
-
-            del target_info[i]
-            did_uninstall = True
-
-    if not did_uninstall:
+    if package not in target_info["packages"]:
         raise CommandError(f"mip: package '{package}' not found")
+
+    package_info = target_info["packages"][package]
+
+    print(f"Uninstalling {package} from {target}")
+    for file in package_info["files"]:
+        full_path = target + "/" + file["path"]
+        print("Uninstalling:", full_path)
+        if transport.fs_exists(full_path):
+            transport.fs_rmfile(full_path)
+            parent_dir = full_path.rsplit("/", maxsplit=1)[0]
+            if parent_dir not in dirs_to_check:
+                dirs_to_check.append(parent_dir)
+
+    # remove directories, which became empty because of this uninstall (except target)
+    while dirs_to_check:
+        dir_to_check = dirs_to_check.pop(0)
+        if dir_to_check != target and not transport.fs_listdir(dir_to_check):
+            print("Removing empty directory:", dir_to_check)
+            transport.fs_rmdir(dir_to_check)
+            parent_dir = dir_to_check.rsplit("/", maxsplit=1)[0]
+            if parent_dir not in dirs_to_check and parent_dir != target:
+                dirs_to_check.append(parent_dir)
+
+    del target_info["packages"][package]
 
 
 def _get_installed_version(package, target_info):
-    # TODO
-    for spec in target_info:
-        if spec["package"] == _normalize_package_specifier(package):
-            return spec.get("resolved_version", spec["requested_version"])
+    spec = target_info["packages"].get(_normalize_package_specifier(package), None)
+    if spec is not None:
+        return spec.get("resolved_version", spec["requested_version"])
 
     return None
 
@@ -321,7 +318,7 @@ def _load_target_info(state, args):
     if state.transport.fs_exists(path):
         return json.loads(state.transport.fs_readfile(path).decode("utf-8"))
     else:
-        return []
+        return {"packages": {}}
 
 
 def _save_target_info(state, args, target_info):
@@ -476,7 +473,7 @@ def do_mip(state, args):
         for package in args.packages:
             print("Uninstall", package)
             _uninstall_package(state.transport, package, args.target, target_info)
-        if target_info == []:
+        if target_info["packages"] == {}:
             target_info_path = _get_target_info_path(args)
             if state.transport.fs_exists(target_info_path):
                 print("Removing empty", target_info_path)

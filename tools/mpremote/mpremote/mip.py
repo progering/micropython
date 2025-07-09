@@ -5,7 +5,6 @@
 import urllib.error
 import urllib.request
 import json
-import tempfile
 import re
 import hashlib
 import os.path
@@ -165,7 +164,13 @@ def _install_json(
 
 
 def _install_package(transport, package, index, target, version, mpy, target_info):
-    _uninstall_package(transport, package, target, target_info, is_expected_to_exist=False)
+    installed_version = _get_installed_version(package, target_info)
+    if installed_version is not None:
+        if _installed_version_matches_requirement(installed_version, version):
+            print(f"Version {installed_version} of {package} is already installed")
+            return
+        else:
+            _uninstall_package(transport, package, target, target_info)
 
     if version is None:
         version = "latest"
@@ -222,7 +227,7 @@ def _list_packages(args, target_info):
         print()
 
 
-def _uninstall_package(transport, package, target, target_info, is_expected_to_exist):
+def _uninstall_package(transport, package, target, target_info):
     target = target.rstrip("/")
     dirs_to_check = []
     did_uninstall = False
@@ -253,12 +258,26 @@ def _uninstall_package(transport, package, target, target_info, is_expected_to_e
             del target_info[i]
             did_uninstall = True
 
-    if not did_uninstall and is_expected_to_exist:
+    if not did_uninstall:
         raise CommandError(f"mip: package '{package}' not found")
 
+def _get_installed_version(package, target_info):
+    # TODO
+    for spec in target_info:
+        if spec["package"] == _normalize_package_specifier(package):
+            return spec.get("resolved_version", spec["requested_version"])
+
+    return None
+
+def _installed_version_matches_requirement(installed_version, requirement):
+    if requirement == "latest":
+        # explicit "latest" always requires re-install
+        return False
+
+    return requirement is None or installed_version == requirement
 
 def _get_target_info_path(args):
-    return args.target.rstrip("/") + "/packages-info.json"
+    return args.target.rstrip("/") + "/mip-packages.json"
 
 
 def _normalize_package_specifier(package):
@@ -268,6 +287,14 @@ def _normalize_package_specifier(package):
     package_json_url_suffix = "/package.json"
     if package.startswith(allowed_mip_url_prefixes) and package.endswith(package_json_url_suffix):
         return package[: -len(package_json_url_suffix)]
+
+
+    # TODO: What to do with trailing slashes?
+
+    if ":" not in package:
+        # index package
+        # TODO: is this right?
+        return re.sub(r"[-_.]+", "-", package.lower()).strip("-")
 
     return package
 
@@ -431,9 +458,7 @@ def do_mip(state, args):
 
         for package in args.packages:
             print("Uninstall", package)
-            _uninstall_package(
-                state.transport, package, args.target, target_info, is_expected_to_exist=True
-            )
+            _uninstall_package(state.transport, package, args.target, target_info)
         if target_info == []:
             target_info_path = _get_target_info_path(args)
             if state.transport.fs_exists(target_info_path):

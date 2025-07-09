@@ -321,11 +321,13 @@ def _load_target_info(state, args):
         return {"packages": {}}
 
 
-def _save_target_info(state, args, target_info):
-    state.transport.fs_writefile(
-        _get_target_info_path(args),
-        json.dumps(target_info, indent=2).encode("utf-8"),
-    )
+def _save_target_info(state, args, target_info, pretty = False):
+    if pretty:
+        json_str = json.dumps(target_info, indent=2)
+    else:
+        json_str = json.dumps(target_info)
+
+    state.transport.fs_writefile(_get_target_info_path(args), json_str.encode("utf-8"))
 
 
 def _try_resolve_version_as_git_reference(package, version):
